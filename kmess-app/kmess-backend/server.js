@@ -14,6 +14,8 @@ const authRoutes = require('./src/routes/authRoutes');
 const userRoutes = require('./src/routes/userRoutes');
 const postRoutes = require('./src/routes/postRoutes');
 const gameRoutes = require('./src/routes/gameRoutes');
+const friendsRoutes = require('./src/routes/friendsRoutes');
+const messagesRoutes = require('./src/routes/messagesRoutes');
 
 // Import middleware
 const errorHandler = require('./src/middleware/errorHandler');
@@ -60,7 +62,9 @@ app.get('/', (req, res) => {
             auth: '/api/auth',
             users: '/api/users',
             posts: '/api/posts',
-            games: '/api/games'
+            games: '/api/games',
+            friends: '/api/friends',
+            messages: '/api/messages'
         }
     });
 });
@@ -70,10 +74,22 @@ app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/posts', postRoutes);
 app.use('/api/games', gameRoutes);
+app.use('/api/friends', friendsRoutes);
+app.use('/api/messages', messagesRoutes);
 
 // Socket.io for real-time features
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
+
+    // User authentication for socket
+    socket.on('authenticate', (data) => {
+        socket.userId = data.userId;
+        socket.join(`user_${data.userId}`);
+        console.log(`User ${data.userId} authenticated with socket ${socket.id}`);
+
+        // Update user status to online
+        updateUserStatus(data.userId, 'online');
+    });
 
     // Game room handling
     socket.on('join-game-room', (roomId) => {
@@ -93,15 +109,98 @@ io.on('connection', (socket) => {
         socket.to(data.roomId).emit('game-action', data);
     });
 
-    // Chat messages
-    socket.on('chat-message', (data) => {
-        socket.to(data.roomId).emit('chat-message', data);
+    // Chat/Messaging events
+    socket.on('join-conversation', (conversationId) => {
+        socket.join(`conversation_${conversationId}`);
+        console.log(`User ${socket.userId} joined conversation: ${conversationId}`);
+    });
+
+    socket.on('leave-conversation', (conversationId) => {
+        socket.leave(`conversation_${conversationId}`);
+        console.log(`User ${socket.userId} left conversation: ${conversationId}`);
+    });
+
+    socket.on('send-message', (messageData) => {
+        // Broadcast message to all users in the conversation
+        socket.to(`conversation_${messageData.conversationId}`).emit('new-message', messageData);
+    });
+
+    socket.on('typing-start', (data) => {
+        socket.to(`conversation_${data.conversationId}`).emit('user-typing', {
+            userId: socket.userId,
+            conversationId: data.conversationId
+        });
+    });
+
+    socket.on('typing-stop', (data) => {
+        socket.to(`conversation_${data.conversationId}`).emit('user-stop-typing', {
+            userId: socket.userId,
+            conversationId: data.conversationId
+        });
+    });
+
+    // Friend request notifications
+    socket.on('friend-request-sent', (data) => {
+        socket.to(`user_${data.toUserId}`).emit('friend-request-received', {
+            from: data.from,
+            friendshipId: data.friendshipId
+        });
+    });
+
+    socket.on('friend-request-accepted', (data) => {
+        socket.to(`user_${data.toUserId}`).emit('friend-request-accepted', {
+            from: data.from,
+            friendshipId: data.friendshipId
+        });
+    });
+
+    // Online status
+    socket.on('update-status', (status) => {
+        if (socket.userId) {
+            updateUserStatus(socket.userId, status);
+            // Broadcast status update to friends
+            broadcastStatusToFriends(socket.userId, status);
+        }
     });
 
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
+        if (socket.userId) {
+            updateUserStatus(socket.userId, 'offline');
+            broadcastStatusToFriends(socket.userId, 'offline');
+        }
     });
 });
+
+// Helper functions for Socket.io
+async function updateUserStatus(userId, status) {
+    try {
+        const { connection } = require('./src/config/database');
+        await connection.execute(
+            'INSERT INTO user_status (user_id, status, last_seen) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE status = ?, last_seen = NOW()', [userId, status, status]
+        );
+    } catch (error) {
+        console.error('Error updating user status:', error);
+    }
+}
+
+async function broadcastStatusToFriends(userId, status) {
+    try {
+        const { connection } = require('./src/config/database');
+        const [friends] = await connection.execute(
+            'SELECT friend_id FROM user_friends WHERE user_id = ?', [userId]
+        );
+
+        friends.forEach(friend => {
+            io.to(`user_${friend.friend_id}`).emit('friend-status-update', {
+                userId,
+                status
+            });
+        });
+    } catch (error) {
+        console.error('Error broadcasting status to friends:', error);
+    }
+}
 
 // Error handling middleware (must be last)
 app.use(errorHandler);
