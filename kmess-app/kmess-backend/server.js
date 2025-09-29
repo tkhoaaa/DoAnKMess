@@ -40,7 +40,9 @@ app.use(cors({
         'http://localhost:19000', // Alternative port
         'exp://localhost:8081', // Expo scheme
         'exp://192.168.1.7:8081', // Local network
-        'http://192.168.1.7:8081' // IP address for device testing
+        'http://192.168.1.7:8081', // IP address for device testing
+        'exp://172.20.10.3:8081', // Current network
+        'http://172.20.10.3:8081' // Current network HTTP
     ],
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -56,7 +58,7 @@ app.use('/uploads', express.static('uploads'));
 // Routes
 app.get('/', (req, res) => {
     res.json({
-        message: 'KMess API Server is running! 🚀',
+        message: 'KMess API Server đã sẵn sàng! 🚀',
         version: '1.0.0',
         endpoints: {
             auth: '/api/auth',
@@ -66,6 +68,16 @@ app.get('/', (req, res) => {
             friends: '/api/friends',
             messages: '/api/messages'
         }
+    });
+});
+
+// Health check endpoint for network discovery
+app.get('/api/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        message: 'Server is healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
     });
 });
 
@@ -175,8 +187,8 @@ io.on('connection', (socket) => {
 // Helper functions for Socket.io
 async function updateUserStatus(userId, status) {
     try {
-        const { connection } = require('./src/config/database');
-        await connection.execute(
+        const { promisePool } = require('./src/config/database');
+        await promisePool.execute(
             'INSERT INTO user_status (user_id, status, last_seen) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE status = ?, last_seen = NOW()', [userId, status, status]
         );
     } catch (error) {
@@ -186,8 +198,8 @@ async function updateUserStatus(userId, status) {
 
 async function broadcastStatusToFriends(userId, status) {
     try {
-        const { connection } = require('./src/config/database');
-        const [friends] = await connection.execute(
+        const { promisePool } = require('./src/config/database');
+        const [friends] = await promisePool.execute(
             'SELECT friend_id FROM user_friends WHERE user_id = ?', [userId]
         );
 
@@ -230,9 +242,9 @@ const startServer = async() => {
 
         // Start server
         server.listen(PORT, '0.0.0.0', () => {
-            console.log(`🚀 KMess Server is running on http://192.168.1.7:${PORT}`);
+            console.log(`🚀 KMess Server is running on http://172.20.10.3:${PORT}`);
             console.log(`🌐 Server listening on all network interfaces`);
-            console.log(`📱 Health check: http://192.168.1.7:${PORT}`);
+            console.log(`📱 Health check: http://172.20.10.3:${PORT}`);
             console.log(`🎮 Socket.io server ready for real-time games`);
             console.log(`✅ MySQL database connected successfully`);
             console.log(`📱 Real authentication enabled - users will be saved to database!`);

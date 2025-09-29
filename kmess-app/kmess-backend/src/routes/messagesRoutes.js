@@ -13,6 +13,9 @@ router.get('/conversations', authenticateToken, messagesController.getConversati
 // Get or create conversation with a friend
 router.post('/conversations', authenticateToken, messagesController.createConversation);
 
+// Get or create direct conversation with friend
+router.post('/conversations/direct/:friendId', authenticateToken, messagesController.getOrCreateDirectConversation);
+
 // Get conversation details
 router.get('/conversations/:conversationId', authenticateToken, messagesController.getConversation);
 

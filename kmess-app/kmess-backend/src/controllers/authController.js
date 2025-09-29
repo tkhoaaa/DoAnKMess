@@ -138,52 +138,7 @@ const getMe = async(req, res, next) => {
     }
 };
 
-// @desc    Protect routes (authentication middleware)
-const protect = async(req, res, next) => {
-    try {
-        let token;
-
-        // Check for token in headers
-        if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-            token = req.headers.authorization.split(' ')[1];
-        }
-
-        if (!token) {
-            return res.status(401).json({
-                success: false,
-                error: 'No token provided, authorization denied'
-            });
-        }
-
-        // Verify token
-        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'kmess_super_secret_key');
-
-        // Get user from database
-        const [users] = await promisePool.execute(
-            `SELECT id, username, email, display_name, avatar_url, bio, total_score 
-       FROM users WHERE id = ?`, [decoded.userId]
-        );
-
-        if (users.length === 0) {
-            return res.status(401).json({
-                success: false,
-                error: 'Token is not valid'
-            });
-        }
-
-        req.user = users[0];
-        next();
-
-    } catch (error) {
-        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
-            return res.status(401).json({
-                success: false,
-                error: 'Token is not valid'
-            });
-        }
-        next(error);
-    }
-};
+// Authentication middleware moved to ../middleware/auth.js
 
 // Placeholder functions for future implementation
 const updateProfile = async(req, res, next) => {
@@ -206,7 +161,6 @@ module.exports = {
     register,
     login,
     getMe,
-    protect,
     updateProfile,
     updatePassword,
     forgotPassword,

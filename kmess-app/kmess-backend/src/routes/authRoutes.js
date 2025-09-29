@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const authController = require('../controllers/authController');
 const { validateRegister, validateLogin } = require('../middleware/validation');
+const { authenticateToken } = require('../middleware/auth');
 
 // @route   POST /api/auth/register
 // @desc    Register a new user
@@ -16,17 +17,17 @@ router.post('/login', validateLogin, authController.login);
 // @route   GET /api/auth/me
 // @desc    Get current logged in user
 // @access  Private
-router.get('/me', authController.protect, authController.getMe);
+router.get('/me', authenticateToken, authController.getMe);
 
 // @route   PUT /api/auth/updateprofile
 // @desc    Update user profile
 // @access  Private
-router.put('/updateprofile', authController.protect, authController.updateProfile);
+router.put('/updateprofile', authenticateToken, authController.updateProfile);
 
 // @route   PUT /api/auth/updatepassword
 // @desc    Update password
 // @access  Private  
-router.put('/updatepassword', authController.protect, authController.updatePassword);
+router.put('/updatepassword', authenticateToken, authController.updatePassword);
 
 // @route   POST /api/auth/forgotpassword
 // @desc    Forgot password

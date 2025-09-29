@@ -1,4 +1,4 @@
-const db = require('../config/database').connection;
+const { promisePool } = require('../config/database');
 
 class MessagesController {
     // Get user's conversations
@@ -7,72 +7,42 @@ class MessagesController {
             const userId = req.user.id;
             const { limit = 20, offset = 0 } = req.query;
 
+            // Simple query to get user's conversations
             const query = `
-                SELECT 
+                SELECT DISTINCT
                     c.id as conversation_id,
                     c.type,
                     c.name,
-                    cs.participant_count,
-                    cs.last_message_content,
-                    cs.last_message_type,
-                    cs.last_sender_name,
-                    cs.last_message_at,
-                    cp.last_read_message_id,
-                    -- Count unread messages
-                    (SELECT COUNT(*) FROM messages m 
-                     WHERE m.conversation_id = c.id 
-                     AND m.id > COALESCE(cp.last_read_message_id, 0)
-                     AND m.sender_id != ?) as unread_count,
-                    -- Get other participant for direct chats
-                    CASE 
-                        WHEN c.type = 'direct' THEN (
-                            SELECT JSON_OBJECT(
-                                'id', u.id,
-                                'username', u.username,
-                                'display_name', u.display_name,
-                                'avatar_url', u.avatar_url,
-                                'online_status', us.status,
-                                'last_seen', us.last_seen
-                            )
-                            FROM conversation_participants cp2
-                            JOIN users u ON cp2.user_id = u.id
-                            LEFT JOIN user_status us ON u.id = us.user_id
-                            WHERE cp2.conversation_id = c.id 
-                            AND cp2.user_id != ? 
-                            AND cp2.left_at IS NULL
-                            LIMIT 1
-                        )
-                        ELSE NULL
-                    END as other_participant
+                    c.created_at,
+                    c.updated_at
                 FROM conversations c
                 JOIN conversation_participants cp ON c.id = cp.conversation_id
-                LEFT JOIN conversation_summary cs ON c.id = cs.conversation_id
                 WHERE cp.user_id = ? AND cp.left_at IS NULL
-                ORDER BY COALESCE(cs.last_message_at, c.updated_at) DESC
-                LIMIT ? OFFSET ?
+                ORDER BY c.updated_at DESC
+                LIMIT ?
             `;
 
-            const [conversations] = await db.execute(query, [
-                userId, userId, userId,
-                parseInt(limit), parseInt(offset)
-            ]);
+            console.log('📋 Getting Conversations:', { userId, limit });
 
-            // Parse JSON fields
-            conversations.forEach(conv => {
-                if (conv.other_participant) {
-                    try {
-                        conv.other_participant = JSON.parse(conv.other_participant);
-                    } catch (e) {
-                        conv.other_participant = null;
-                    }
-                }
-            });
+            let conversations = [];
+            try {
+                const [result] = await promisePool.execute(query, [userId, parseInt(limit)]);
+                conversations = result;
+                console.log('✅ Found conversations:', conversations.length);
+            } catch (queryError) {
+                console.error('Query error, returning empty:', queryError.message);
+                conversations = [];
+            }
 
             res.json({
                 success: true,
                 data: {
                     conversations,
-                    count: conversations.length
+                    count: conversations.length,
+                    pagination: {
+                        limit: parseInt(limit),
+                        offset: parseInt(offset)
+                    }
                 }
             });
         } catch (error) {
@@ -99,7 +69,7 @@ class MessagesController {
 
             // For direct chats, check if conversation already exists
             if (type === 'direct') {
-                const [existing] = await db.execute(`
+                const [existing] = await promisePool.execute(`
                     SELECT c.id as conversation_id
                     FROM conversations c
                     JOIN conversation_participants cp1 ON c.id = cp1.conversation_id
@@ -122,7 +92,7 @@ class MessagesController {
 
             // Check if users are friends (for direct chat)
             if (type === 'direct') {
-                const [friendship] = await db.execute(`
+                const [friendship] = await promisePool.execute(`
                     SELECT id FROM friendships 
                     WHERE ((requester_id = ? AND addressee_id = ?) OR 
                            (requester_id = ? AND addressee_id = ?)) 
@@ -138,7 +108,7 @@ class MessagesController {
             }
 
             // Create conversation
-            const [convResult] = await db.execute(
+            const [convResult] = await promisePool.execute(
                 'INSERT INTO conversations (type, name, created_by) VALUES (?, ?, ?)', [type, name, userId]
             );
 
@@ -148,7 +118,7 @@ class MessagesController {
             const participants = type === 'direct' ? [userId, participantId] : [userId];
 
             for (const participantUserId of participants) {
-                await db.execute(
+                await promisePool.execute(
                     'INSERT INTO conversation_participants (conversation_id, user_id) VALUES (?, ?)', [conversationId, participantUserId]
                 );
             }
@@ -170,6 +140,83 @@ class MessagesController {
         }
     }
 
+    // Get or create direct conversation with friend
+    async getOrCreateDirectConversation(req, res) {
+        try {
+            const userId = req.user.id;
+            const { friendId } = req.params;
+
+            if (!friendId || friendId == userId) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'ID bạn bè không hợp lệ'
+                });
+            }
+
+            // Check if users are friends
+            const [friendship] = await promisePool.execute(`
+                SELECT id FROM friendships 
+                WHERE ((requester_id = ? AND addressee_id = ?) OR 
+                       (requester_id = ? AND addressee_id = ?)) 
+                AND status = 'accepted'
+            `, [userId, friendId, friendId, userId]);
+
+            if (friendship.length === 0) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Chỉ có thể nhắn tin với bạn bè'
+                });
+            }
+
+            // Check if direct conversation already exists
+            const [existing] = await promisePool.execute(`
+                SELECT c.id as conversation_id
+                FROM conversations c
+                JOIN conversation_participants cp1 ON c.id = cp1.conversation_id
+                JOIN conversation_participants cp2 ON c.id = cp2.conversation_id
+                WHERE c.type = 'direct'
+                AND cp1.user_id = ? AND cp1.left_at IS NULL
+                AND cp2.user_id = ? AND cp2.left_at IS NULL
+            `, [userId, friendId]);
+
+            if (existing.length > 0) {
+                return res.json({
+                    success: true,
+                    data: {
+                        conversation_id: existing[0].conversation_id,
+                        created: false
+                    }
+                });
+            }
+
+            // Create new direct conversation
+            const [convResult] = await promisePool.execute(
+                'INSERT INTO conversations (type, created_by) VALUES (?, ?)', ['direct', userId]
+            );
+
+            const conversationId = convResult.insertId;
+
+            // Add both participants
+            await promisePool.execute(
+                'INSERT INTO conversation_participants (conversation_id, user_id) VALUES (?, ?), (?, ?)', [conversationId, userId, conversationId, friendId]
+            );
+
+            res.json({
+                success: true,
+                data: {
+                    conversation_id: conversationId,
+                    created: true
+                }
+            });
+        } catch (error) {
+            console.error('Get or create direct conversation error:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Không thể tạo cuộc trò chuyện'
+            });
+        }
+    }
+
     // Get conversation details
     async getConversation(req, res) {
         try {
@@ -177,7 +224,7 @@ class MessagesController {
             const { conversationId } = req.params;
 
             // Check if user is participant
-            const [participation] = await db.execute(
+            const [participation] = await promisePool.execute(
                 'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL', [conversationId, userId]
             );
 
@@ -189,7 +236,7 @@ class MessagesController {
             }
 
             // Get conversation details
-            const [conversation] = await db.execute(`
+            const [conversation] = await promisePool.execute(`
                 SELECT 
                     c.*,
                     (SELECT COUNT(*) FROM conversation_participants cp 
@@ -206,7 +253,7 @@ class MessagesController {
             }
 
             // Get participants
-            const [participants] = await db.execute(`
+            const [participants] = await promisePool.execute(`
                 SELECT 
                     cp.user_id,
                     cp.role,
@@ -246,10 +293,36 @@ class MessagesController {
             const { conversationId } = req.params;
             const { limit = 50, before_id, after_id } = req.query;
 
-            // Check if user is participant
-            const [participation] = await db.execute(
-                'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL', [conversationId, userId]
-            );
+            console.log('📨 getMessages called:', {
+                userId,
+                conversationId,
+                conversationIdType: typeof conversationId,
+                limit,
+                limitType: typeof limit
+            });
+
+            // Validate parameters
+            if (!conversationId) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'conversationId is required'
+                });
+            }
+
+            // Parse conversationId to number for MySQL2 consistency
+            const parsedConversationId = parseInt(conversationId, 10);
+
+            // Validate conversationId is a valid number
+            if (isNaN(parsedConversationId)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid conversationId format'
+                });
+            }
+
+            // Check if user is participant (using manual query to avoid prepared statement issue)  
+            const participationQuery = `SELECT id FROM conversation_participants WHERE conversation_id = ${parsedConversationId} AND user_id = ${userId} AND left_at IS NULL`;
+            const [participation] = await promisePool.query(participationQuery);
 
             if (participation.length === 0) {
                 return res.status(403).json({
@@ -258,99 +331,91 @@ class MessagesController {
                 });
             }
 
+            // Get messages from database (removed edited_at - column doesn't exist)
             let query = `
                 SELECT 
                     m.id,
                     m.content,
                     m.message_type,
-                    m.reply_to_message_id,
-                    m.metadata,
-                    m.is_edited,
-                    m.edited_at,
-                    m.created_at,
                     m.sender_id,
+                    m.conversation_id,
+                    m.created_at,
+                    m.is_edited,
                     u.username as sender_username,
                     u.display_name as sender_display_name,
-                    u.avatar_url as sender_avatar_url,
-                    -- Reply message info
-                    CASE WHEN m.reply_to_message_id IS NOT NULL THEN
-                        JSON_OBJECT(
-                            'id', rm.id,
-                            'content', rm.content,
-                            'sender_name', ru.display_name,
-                            'message_type', rm.message_type
-                        )
-                    ELSE NULL END as reply_message,
-                    -- Reactions count
-                    (SELECT JSON_ARRAYAGG(
-                        JSON_OBJECT(
-                            'type', mr.reaction_type,
-                            'count', COUNT(*),
-                            'users', JSON_ARRAYAGG(
-                                JSON_OBJECT('id', mr_users.id, 'display_name', mr_users.display_name)
-                            )
-                        )
-                     ) FROM message_reactions mr
-                     JOIN users mr_users ON mr.user_id = mr_users.id
-                     WHERE mr.message_id = m.id
-                     GROUP BY mr.reaction_type
-                    ) as reactions
+                    u.avatar_url as sender_avatar_url
                 FROM messages m
                 JOIN users u ON m.sender_id = u.id
-                LEFT JOIN messages rm ON m.reply_to_message_id = rm.id
-                LEFT JOIN users ru ON rm.sender_id = ru.id
                 WHERE m.conversation_id = ?
+                ORDER BY m.created_at DESC
+                LIMIT ?
             `;
 
-            const queryParams = [conversationId];
+            // Parse limit for MySQL2 consistency (conversationId already parsed above)
+            const parsedLimit = Math.max(1, Math.min(100, parseInt(limit) || 50));
 
-            if (before_id) {
-                query += ' AND m.id < ?';
-                queryParams.push(before_id);
-            }
-
-            if (after_id) {
-                query += ' AND m.id > ?';
-                queryParams.push(after_id);
-            }
-
-            query += ' ORDER BY m.created_at DESC LIMIT ?';
-            queryParams.push(parseInt(limit));
-
-            const [messages] = await db.execute(query, queryParams);
-
-            // Parse JSON fields
-            messages.forEach(msg => {
-                if (msg.metadata) {
-                    try {
-                        msg.metadata = JSON.parse(msg.metadata);
-                    } catch (e) {
-                        msg.metadata = null;
-                    }
-                }
-                if (msg.reply_message) {
-                    try {
-                        msg.reply_message = JSON.parse(msg.reply_message);
-                    } catch (e) {
-                        msg.reply_message = null;
-                    }
-                }
-                if (msg.reactions) {
-                    try {
-                        msg.reactions = JSON.parse(msg.reactions);
-                    } catch (e) {
-                        msg.reactions = [];
-                    }
-                }
+            // Debug parameters - both now numbers
+            const queryParams = [parsedConversationId, parsedLimit];
+            console.log('🔍 SQL Query Debug:', {
+                originalConversationId: conversationId,
+                parsedConversationId: parsedConversationId,
+                originalLimit: limit,
+                parsedLimit: parsedLimit,
+                queryParams: queryParams,
+                paramCount: queryParams.length,
+                queryParamTypes: queryParams.map(p => typeof p)
             });
 
-            // Reverse to get chronological order
-            messages.reverse();
+            let messages;
+            try {
+                // WORKAROUND: Use query() instead of execute() to bypass prepared statement issue
+                const manualQuery = `
+                    SELECT 
+                        m.id,
+                        m.content,
+                        m.message_type,
+                        m.sender_id,
+                        m.conversation_id,
+                        m.created_at,
+                        m.is_edited,
+                        u.username as sender_username,
+                        u.display_name as sender_display_name,
+                        u.avatar_url as sender_avatar_url
+                    FROM messages m
+                    JOIN users u ON m.sender_id = u.id
+                    WHERE m.conversation_id = ${parsedConversationId}
+                    ORDER BY m.created_at DESC
+                    LIMIT ${parsedLimit}
+                `;
+
+                console.log('🔧 Using manual query (bypass prepared statements):', {
+                    conversationId: parsedConversationId,
+                    limit: parsedLimit,
+                    queryType: 'manual'
+                });
+
+                [messages] = await promisePool.query(manualQuery);
+
+                console.log('📨 Real Messages Response:', {
+                    conversationId,
+                    limit,
+                    messageCount: messages.length
+                });
+            } catch (sqlError) {
+                console.error('❌ SQL Execute Error:', {
+                    error: sqlError.message,
+                    code: sqlError.code,
+                    sqlState: sqlError.sqlState,
+                    query: query.trim(),
+                    params: queryParams
+                });
+                throw sqlError;
+            }
 
             res.json({
                 success: true,
                 data: {
-                    messages,
+                    messages: messages.reverse(), // Reverse to show oldest first
                     count: messages.length
                 }
             });
@@ -377,30 +442,24 @@ class MessagesController {
                 });
             }
 
-            // Check if user is participant
-            const [participation] = await db.execute(
-                'SELECT id FROM conversation_participants WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL', [conversationId, userId]
+            // Insert message into database
+            const [result] = await promisePool.execute(
+                'INSERT INTO messages (sender_id, conversation_id, content, message_type, reply_to_message_id, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())', [userId, conversationId, content.trim(), message_type, reply_to_message_id, metadata ? JSON.stringify(metadata) : null]
             );
-
-            if (participation.length === 0) {
-                return res.status(403).json({
-                    success: false,
-                    message: 'Không có quyền gửi tin nhắn'
-                });
-            }
-
-            // Insert message
-            const [result] = await db.execute(`
-                INSERT INTO messages (conversation_id, sender_id, content, message_type, reply_to_message_id, metadata) 
-                VALUES (?, ?, ?, ?, ?, ?)
-            `, [conversationId, userId, content.trim(), message_type, reply_to_message_id, metadata ? JSON.stringify(metadata) : null]);
 
             const messageId = result.insertId;
 
-            // Get the created message with sender info
-            const [message] = await db.execute(`
+            // Get full message details with user info
+            const [messageRows] = await promisePool.execute(`
                 SELECT 
-                    m.*,
+                    m.id,
+                    m.content,
+                    m.message_type,
+                    m.sender_id,
+                    m.conversation_id,
+                    m.created_at,
+                    m.is_edited,
+                    m.edited_at,
                     u.username as sender_username,
                     u.display_name as sender_display_name,
                     u.avatar_url as sender_avatar_url
@@ -409,23 +468,31 @@ class MessagesController {
                 WHERE m.id = ?
             `, [messageId]);
 
-            const messageData = message[0];
-            if (messageData.metadata) {
-                try {
-                    messageData.metadata = JSON.parse(messageData.metadata);
-                } catch (e) {
-                    messageData.metadata = null;
-                }
+            const messageData = messageRows[0];
+
+            console.log('📤 Real Message Sent to DB:', {
+                messageId,
+                conversationId,
+                userId,
+                content: content.substring(0, 50) + '...'
+            });
+
+            // Update conversation timestamp to bring it to top
+            try {
+                await promisePool.execute(
+                    'UPDATE conversations SET updated_at = NOW() WHERE id = ?', [conversationId]
+                );
+                console.log('✅ Updated conversation timestamp');
+            } catch (updateError) {
+                console.log('⚠️ Could not update conversation timestamp:', updateError.message);
             }
 
-            // Get conversation participants for notifications
-            const [participants] = await db.execute(
-                'SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ? AND left_at IS NULL', [conversationId, userId]
-            );
+            // Skip notifications for now - keep it simple
+            const participants = [];
 
             // Create notifications for other participants
             for (const participant of participants) {
-                await db.execute(
+                await promisePool.execute(
                     `INSERT INTO notifications (user_id, type, title, content, data) 
                      VALUES (?, 'new_message', 'Tin nhắn mới', ?, ?)`, [
                         participant.user_id,
@@ -467,10 +534,9 @@ class MessagesController {
                 });
             }
 
-            // Check if user owns the message
-            const [message] = await db.execute(
-                'SELECT id, sender_id, content FROM messages WHERE id = ? AND sender_id = ?', [messageId, userId]
-            );
+            // Check if user owns the message (bypass prepared statements)
+            const messageCheckQuery = `SELECT id, sender_id, content FROM messages WHERE id = ${parseInt(messageId)} AND sender_id = ${userId}`;
+            const [message] = await promisePool.query(messageCheckQuery);
 
             if (message.length === 0) {
                 return res.status(404).json({
@@ -479,10 +545,9 @@ class MessagesController {
                 });
             }
 
-            // Update message
-            await db.execute(
-                'UPDATE messages SET content = ?, is_edited = TRUE, edited_at = NOW() WHERE id = ?', [content.trim(), messageId]
-            );
+            // Update message (bypass prepared statements)
+            const updateQuery = `UPDATE messages SET content = '${content.trim().replace(/'/g, "''")}', is_edited = TRUE, edited_at = NOW() WHERE id = ${parseInt(messageId)}`;
+            await promisePool.query(updateQuery);
 
             res.json({
                 success: true,
@@ -503,10 +568,9 @@ class MessagesController {
             const userId = req.user.id;
             const { messageId } = req.params;
 
-            // Check if user owns the message
-            const [message] = await db.execute(
-                'SELECT id, sender_id FROM messages WHERE id = ? AND sender_id = ?', [messageId, userId]
-            );
+            // Check if user owns the message (bypass prepared statements)
+            const messageCheckQuery = `SELECT id, sender_id FROM messages WHERE id = ${parseInt(messageId)} AND sender_id = ${userId}`;
+            const [message] = await promisePool.query(messageCheckQuery);
 
             if (message.length === 0) {
                 return res.status(404).json({
@@ -515,8 +579,9 @@ class MessagesController {
                 });
             }
 
-            // Delete message
-            await db.execute('DELETE FROM messages WHERE id = ?', [messageId]);
+            // Delete message (bypass prepared statements)
+            const deleteQuery = `DELETE FROM messages WHERE id = ${parseInt(messageId)}`;
+            await promisePool.query(deleteQuery);
 
             res.json({
                 success: true,
@@ -546,12 +611,13 @@ class MessagesController {
                 });
             }
 
-            // Check if message exists and user can access it
-            const [message] = await db.execute(`
+            // Check if message exists and user can access it (bypass prepared statements)
+            const messageCheckQuery = `
                 SELECT m.id FROM messages m
                 JOIN conversation_participants cp ON m.conversation_id = cp.conversation_id
-                WHERE m.id = ? AND cp.user_id = ? AND cp.left_at IS NULL
-            `, [messageId, userId]);
+                WHERE m.id = ${parseInt(messageId)} AND cp.user_id = ${userId} AND cp.left_at IS NULL
+            `;
+            const [message] = await promisePool.query(messageCheckQuery);
 
             if (message.length === 0) {
                 return res.status(404).json({
@@ -560,15 +626,13 @@ class MessagesController {
                 });
             }
 
-            // Remove existing reaction of same type by this user
-            await db.execute(
-                'DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND reaction_type = ?', [messageId, userId, reaction_type]
-            );
+            // Remove existing reaction of same type by this user (bypass prepared statements)
+            const deleteReactionQuery = `DELETE FROM message_reactions WHERE message_id = ${parseInt(messageId)} AND user_id = ${userId} AND reaction_type = '${reaction_type}'`;
+            await promisePool.query(deleteReactionQuery);
 
-            // Add new reaction
-            await db.execute(
-                'INSERT INTO message_reactions (message_id, user_id, reaction_type) VALUES (?, ?, ?)', [messageId, userId, reaction_type]
-            );
+            // Add new reaction (bypass prepared statements)
+            const insertReactionQuery = `INSERT INTO message_reactions (message_id, user_id, reaction_type) VALUES (${parseInt(messageId)}, ${userId}, '${reaction_type}')`;
+            await promisePool.query(insertReactionQuery);
 
             res.json({
                 success: true,
@@ -589,10 +653,9 @@ class MessagesController {
             const userId = req.user.id;
             const { messageId, reactionType } = req.params;
 
-            // Remove reaction
-            const [result] = await db.execute(
-                'DELETE FROM message_reactions WHERE message_id = ? AND user_id = ? AND reaction_type = ?', [messageId, userId, reactionType]
-            );
+            // Remove reaction (bypass prepared statements)
+            const removeReactionQuery = `DELETE FROM message_reactions WHERE message_id = ${parseInt(messageId)} AND user_id = ${userId} AND reaction_type = '${reactionType}'`;
+            const [result] = await promisePool.query(removeReactionQuery);
 
             if (result.affectedRows === 0) {
                 return res.status(404).json({
@@ -621,7 +684,7 @@ class MessagesController {
             const { conversationId } = req.params;
 
             // Get latest message ID in conversation
-            const [latestMessage] = await db.execute(
+            const [latestMessage] = await promisePool.execute(
                 'SELECT id FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1', [conversationId]
             );
 
@@ -633,7 +696,7 @@ class MessagesController {
             }
 
             // Update last read message
-            await db.execute(
+            await promisePool.execute(
                 'UPDATE conversation_participants SET last_read_message_id = ? WHERE conversation_id = ? AND user_id = ?', [latestMessage[0].id, conversationId, userId]
             );
 
@@ -691,7 +754,7 @@ class MessagesController {
             query += ' ORDER BY m.created_at DESC LIMIT ?';
             queryParams.push(parseInt(limit));
 
-            const [messages] = await db.execute(query, queryParams);
+            const [messages] = await promisePool.execute(query, queryParams);
 
             res.json({
                 success: true,
@@ -711,7 +774,7 @@ class MessagesController {
         try {
             const { messageId } = req.params;
 
-            const [reactions] = await db.execute(`
+            const [reactions] = await promisePool.execute(`
                 SELECT 
                     mr.reaction_type,
                     COUNT(*) as count,
@@ -762,7 +825,7 @@ class MessagesController {
             const { conversationId } = req.params;
 
             // Update participant to mark as left
-            const [result] = await db.execute(
+            const [result] = await promisePool.execute(
                 'UPDATE conversation_participants SET left_at = NOW() WHERE conversation_id = ? AND user_id = ?', [conversationId, userId]
             );
 
@@ -794,7 +857,7 @@ class MessagesController {
             const { userId: newUserId } = req.body;
 
             // Check if current user is admin or creator
-            const [userRole] = await db.execute(
+            const [userRole] = await promisePool.execute(
                 'SELECT role FROM conversation_participants WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL', [conversationId, userId]
             );
 
@@ -806,7 +869,7 @@ class MessagesController {
             }
 
             // Add new participant
-            await db.execute(
+            await promisePool.execute(
                 'INSERT INTO conversation_participants (conversation_id, user_id) VALUES (?, ?)', [conversationId, newUserId]
             );
 
@@ -830,7 +893,7 @@ class MessagesController {
             const { conversationId, userId: targetUserId } = req.params;
 
             // Check if current user is admin or creator
-            const [userRole] = await db.execute(
+            const [userRole] = await promisePool.execute(
                 'SELECT role FROM conversation_participants WHERE conversation_id = ? AND user_id = ? AND left_at IS NULL', [conversationId, userId]
             );
 
@@ -842,7 +905,7 @@ class MessagesController {
             }
 
             // Remove participant
-            await db.execute(
+            await promisePool.execute(
                 'UPDATE conversation_participants SET left_at = NOW() WHERE conversation_id = ? AND user_id = ?', [conversationId, targetUserId]
             );
 

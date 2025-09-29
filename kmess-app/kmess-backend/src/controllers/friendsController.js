@@ -1,4 +1,4 @@
-const db = require('../config/database').connection;
+const { promisePool } = require('../config/database');
 
 class FriendsController {
     // Get user's friends list
@@ -20,7 +20,7 @@ class FriendsController {
                 ORDER BY uf.friend_display_name ASC
             `;
 
-            const [friends] = await db.execute(query, [userId]);
+            const [friends] = await promisePool.execute(query, [userId]);
 
             res.json({
                 success: true,
@@ -57,7 +57,7 @@ class FriendsController {
                 ORDER BY f.created_at DESC
             `;
 
-            const [requests] = await db.execute(query, [userId]);
+            const [requests] = await promisePool.execute(query, [userId]);
 
             res.json({
                 success: true,
@@ -95,7 +95,7 @@ class FriendsController {
                 ORDER BY f.created_at DESC
             `;
 
-            const [requests] = await db.execute(query, [userId]);
+            const [requests] = await promisePool.execute(query, [userId]);
 
             res.json({
                 success: true,
@@ -126,45 +126,19 @@ class FriendsController {
                 });
             }
 
-            const query = `
-                SELECT 
-                    u.id,
-                    u.username,
-                    u.display_name,
-                    u.avatar_url,
-                    CASE 
-                        WHEN f.status = 'accepted' THEN 'friends'
-                        WHEN f.status = 'pending' AND f.requester_id = ? THEN 'request_sent'
-                        WHEN f.status = 'pending' AND f.addressee_id = ? THEN 'request_received'
-                        WHEN f.status = 'blocked' THEN 'blocked'
-                        ELSE 'none'
-                    END as friendship_status
-                FROM users u
-                LEFT JOIN friendships f ON (
-                    (f.requester_id = ? AND f.addressee_id = u.id) OR 
-                    (f.addressee_id = ? AND f.requester_id = u.id)
-                )
-                WHERE u.id != ? 
-                AND (
-                    u.username LIKE ? OR 
-                    u.display_name LIKE ? OR
-                    u.email LIKE ?
-                )
-                ORDER BY 
-                    CASE WHEN u.username LIKE ? THEN 1 ELSE 2 END,
-                    u.display_name ASC
-                LIMIT ?
-            `;
+            // Test if users table exists at all
+            const query = `SELECT * FROM users LIMIT 1`;
 
-            const searchPattern = `%${searchTerm}%`;
-            const exactPattern = `${searchTerm}%`;
+            const params = [];
 
-            const [users] = await db.execute(query, [
-                userId, userId, userId, userId, userId,
-                searchPattern, searchPattern, searchPattern,
-                exactPattern,
-                parseInt(limit)
-            ]);
+            console.log('🔍 Database Table Test:', {
+                query: query.trim(),
+                paramCount: params.length,
+                params,
+                testType: 'BASIC - Does users table exist?'
+            });
+
+            const [users] = await promisePool.execute(query, params);
 
             res.json({
                 success: true,
@@ -193,7 +167,7 @@ class FriendsController {
             }
 
             // Check if target user exists
-            const [targetUser] = await db.execute(
+            const [targetUser] = await promisePool.execute(
                 'SELECT id, username, display_name FROM users WHERE id = ?', [targetUserId]
             );
 
@@ -205,7 +179,7 @@ class FriendsController {
             }
 
             // Check if friendship already exists
-            const [existingFriendship] = await db.execute(
+            const [existingFriendship] = await promisePool.execute(
                 `SELECT id, status FROM friendships 
                  WHERE (requester_id = ? AND addressee_id = ?) OR 
                        (requester_id = ? AND addressee_id = ?)`, [userId, targetUserId, targetUserId, userId]
@@ -234,12 +208,12 @@ class FriendsController {
             }
 
             // Create friend request
-            const [result] = await db.execute(
+            const [result] = await promisePool.execute(
                 'INSERT INTO friendships (requester_id, addressee_id, status) VALUES (?, ?, "pending")', [userId, targetUserId]
             );
 
             // Create notification for target user
-            await db.execute(
+            await promisePool.execute(
                 `INSERT INTO notifications (user_id, type, title, content, data) 
                  VALUES (?, 'friend_request', 'Lời mời kết bạn', ?, ?)`, [
                     targetUserId,
@@ -272,7 +246,7 @@ class FriendsController {
             const { requestId } = req.params;
 
             // Find and validate friend request
-            const [friendRequest] = await db.execute(
+            const [friendRequest] = await promisePool.execute(
                 `SELECT f.*, u.username, u.display_name 
                  FROM friendships f
                  JOIN users u ON f.requester_id = u.id
@@ -289,12 +263,12 @@ class FriendsController {
             const request = friendRequest[0];
 
             // Update friendship status
-            await db.execute(
+            await promisePool.execute(
                 'UPDATE friendships SET status = "accepted", updated_at = NOW() WHERE id = ?', [requestId]
             );
 
             // Create notification for requester
-            await db.execute(
+            await promisePool.execute(
                 `INSERT INTO notifications (user_id, type, title, content, data) 
                  VALUES (?, 'friend_accepted', 'Kết bạn thành công', ?, ?)`, [
                     request.requester_id,
@@ -331,7 +305,7 @@ class FriendsController {
             const { requestId } = req.params;
 
             // Find and validate friend request
-            const [friendRequest] = await db.execute(
+            const [friendRequest] = await promisePool.execute(
                 'SELECT * FROM friendships WHERE id = ? AND addressee_id = ? AND status = "pending"', [requestId, userId]
             );
 
@@ -343,7 +317,7 @@ class FriendsController {
             }
 
             // Update friendship status to rejected
-            await db.execute(
+            await promisePool.execute(
                 'UPDATE friendships SET status = "rejected", updated_at = NOW() WHERE id = ?', [requestId]
             );
 
@@ -367,7 +341,7 @@ class FriendsController {
             const { friendId } = req.params;
 
             // Find friendship
-            const [friendship] = await db.execute(
+            const [friendship] = await promisePool.execute(
                 `SELECT * FROM friendships 
                  WHERE ((requester_id = ? AND addressee_id = ?) OR 
                         (requester_id = ? AND addressee_id = ?)) 
@@ -382,7 +356,7 @@ class FriendsController {
             }
 
             // Remove friendship
-            await db.execute('DELETE FROM friendships WHERE id = ?', [friendship[0].id]);
+            await promisePool.execute('DELETE FROM friendships WHERE id = ?', [friendship[0].id]);
 
             res.json({
                 success: true,
@@ -411,14 +385,14 @@ class FriendsController {
             }
 
             // Remove existing friendship if any
-            await db.execute(
+            await promisePool.execute(
                 `DELETE FROM friendships 
                  WHERE (requester_id = ? AND addressee_id = ?) OR 
                        (requester_id = ? AND addressee_id = ?)`, [userId, targetUserId, targetUserId, userId]
             );
 
             // Create block relationship
-            await db.execute(
+            await promisePool.execute(
                 'INSERT INTO friendships (requester_id, addressee_id, status) VALUES (?, ?, "blocked")', [userId, targetUserId]
             );
 
@@ -442,7 +416,7 @@ class FriendsController {
             const { userId: targetUserId } = req.params;
 
             // Remove block
-            await db.execute(
+            await promisePool.execute(
                 'DELETE FROM friendships WHERE requester_id = ? AND addressee_id = ? AND status = "blocked"', [userId, targetUserId]
             );
 
@@ -477,7 +451,7 @@ class FriendsController {
                 ORDER BY f.created_at DESC
             `;
 
-            const [blockedUsers] = await db.execute(query, [userId]);
+            const [blockedUsers] = await promisePool.execute(query, [userId]);
 
             res.json({
                 success: true,
@@ -514,7 +488,7 @@ class FriendsController {
                 ORDER BY u.display_name ASC
             `;
 
-            const [mutualFriends] = await db.execute(query, [userId, targetUserId]);
+            const [mutualFriends] = await promisePool.execute(query, [userId, targetUserId]);
 
             res.json({
                 success: true,
@@ -545,7 +519,7 @@ class FriendsController {
                 });
             }
 
-            const [friendship] = await db.execute(
+            const [friendship] = await promisePool.execute(
                 `SELECT status, requester_id FROM friendships 
                  WHERE (requester_id = ? AND addressee_id = ?) OR 
                        (requester_id = ? AND addressee_id = ?)`, [userId, targetUserId, targetUserId, userId]
